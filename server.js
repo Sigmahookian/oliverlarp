@@ -63,8 +63,14 @@ server.on("upgrade", (request, socket, head) => {
     socket.destroy();
     return;
   }
-  if (!isAuthorized(request)) {
+  if (!process.env.BRIDGE_TOKEN ||
+      (request.headers.authorization && !isAuthorized(request))) {
     socket.write("HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n");
+    socket.destroy();
+    return;
+  }
+  if (websocketServer.clients.size >= 256) {
+    socket.write("HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\n\r\n");
     socket.destroy();
     return;
   }
@@ -75,16 +81,25 @@ server.on("upgrade", (request, socket, head) => {
     return;
   }
   websocketServer.handleUpgrade(request, socket, head, (client) => {
-    websocketServer.emit("connection", client, request, room);
+    websocketServer.emit("connection", client, request, room, isAuthorized(request));
   });
 });
 
-websocketServer.on("connection", (client, _request, room) => {
+websocketServer.on("connection", (client, _request, room, authorized) => {
   let sentInWindow = 0;
   let windowStarted = Date.now();
-  const connectionId = store.addSocket(room, client);
-
-  client.send(JSON.stringify({ type: "connected", room, connectionId }));
+  let connectionId = null;
+  let authTimer;
+  function authenticate() {
+    clearTimeout(authTimer);
+    connectionId = store.addSocket(room, client);
+    client.send(JSON.stringify({ type: "connected", room, connectionId }));
+  }
+  if (authorized) {
+    authenticate();
+  } else {
+    authTimer = setTimeout(() => client.close(1008, "Authentication required"), 10_000);
+  }
 
   client.on("message", (raw) => {
     const now = Date.now();
@@ -105,6 +120,15 @@ websocketServer.on("connection", (client, _request, room) => {
       client.send(JSON.stringify({ type: "error", error: "Send JSON: {\"message\":\"text\"}" }));
       return;
     }
+    if (!connectionId) {
+      if (body && body.type === "auth" && typeof body.token === "string" &&
+          hasValidBearerToken("Bearer " + body.token, process.env.BRIDGE_TOKEN || "")) {
+        authenticate();
+      } else {
+        client.close(1008, "Unauthorized");
+      }
+      return;
+    }
     if (!body || typeof body.message !== "string" || body.message.length < 1 || body.message.length > 1000) {
       client.send(JSON.stringify({ type: "error", error: "message must be 1-1000 characters" }));
       return;
@@ -112,8 +136,12 @@ websocketServer.on("connection", (client, _request, room) => {
     store.publish(room, body.message, connectionId);
   });
 
-  client.on("close", () => store.removeSocket(room, connectionId));
-  client.on("error", () => store.removeSocket(room, connectionId));
+  function cleanup() {
+    clearTimeout(authTimer);
+    if (connectionId) store.removeSocket(room, connectionId);
+  }
+  client.on("close", cleanup);
+  client.on("error", cleanup);
 });
 
 server.listen(PORT, "0.0.0.0", () => {
